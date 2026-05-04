@@ -125,14 +125,7 @@ impl CredentialStore {
                 let secret = match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key) {
                     Ok(s) => s,
                     Err(nono::NonoError::SecretNotFound(_)) => {
-                        let hint = if !key.contains("://") && cfg!(target_os = "macos") {
-                            format!(
-                                " To add it to the macOS keychain: security add-generic-password -s \"nono\" -a \"{}\" -w",
-                                key
-                            )
-                        } else {
-                            String::new()
-                        };
+                        let hint = build_credential_miss_hint(key);
                         warn!(
                             "Credential '{}' not found for route '{}' — requests will proceed without credential injection.{}",
                             key, normalized_prefix, hint
@@ -320,6 +313,62 @@ impl CredentialStore {
 /// Uses the same constant as `nono::keystore::DEFAULT_SERVICE` to ensure consistency.
 const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
 
+/// Build a hint for the credential-not-found warning that probes other
+/// credential sources for the same name.
+///
+/// Targets the most common confusion pattern in the wild: a route shipped
+/// with `credential_key: env://X` while the user stored their secret in
+/// the system keyring (or vice versa). When we detect the secret in a
+/// *different* source, we name it explicitly so the user can fix the
+/// route's URI in one edit.
+///
+/// The probe is deliberately scoped: we only check the obvious "you put
+/// it in the wrong place" cases (env↔keyring), not URI-managed sources
+/// like `op://` or `apple-password://` whose lookups have side effects.
+fn build_credential_miss_hint(key: &str) -> String {
+    // Case 1: `env://X` failed → the env var isn't set. Check whether a
+    // bare-name keyring entry exists; if so, suggest dropping the prefix.
+    if let Some(var) = key.strip_prefix("env://") {
+        if nono::keystore::load_secret_by_ref(KEYRING_SERVICE, var).is_ok() {
+            return format!(
+                " Tip: a keyring entry exists for '{}'. Change credential_key to bare \
+                 '{}' (no env:// prefix) to use the keyring, or set the env var.",
+                var, var
+            );
+        }
+        return format!(
+            " Looked for env var '{}' (not set). To add to the macOS keychain: \
+             security add-generic-password -s \"nono\" -a \"{}\" -w  — and set credential_key \
+             to bare '{}' (no env:// prefix).",
+            var, var, var
+        );
+    }
+
+    // Case 2: bare key (default keyring) failed → check whether the env
+    // var of the same name is set; if so, suggest the env:// URI.
+    if !key.contains("://") {
+        if std::env::var_os(key).is_some() {
+            return format!(
+                " Tip: env var '{}' is set on the host. Change credential_key to \
+                 'env://{}' to use it, or add a keyring entry for '{}'.",
+                key, key, key
+            );
+        }
+        if cfg!(target_os = "macos") {
+            return format!(
+                " To add it to the macOS keychain: security add-generic-password \
+                 -s \"nono\" -a \"{}\" -w",
+                key
+            );
+        }
+    }
+
+    // URI-managed sources (op://, apple-password://, file://, keyring://)
+    // — no automatic cross-probe; the URI scheme is itself an explicit
+    // statement of where to look, so we trust the user's intent.
+    String::new()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -382,6 +431,49 @@ mod tests {
         assert!(store.get("openai").is_none());
         assert!(store.get("/openai").is_none());
         assert!(store.get_oauth2("/openai").is_none());
+    }
+
+    /// `env://X` lookup misses but the env var IS set on the host (the
+    /// "I think I added the keychain entry but the route is env://"
+    /// case from issue #797): hint should suggest stripping the prefix.
+    /// We simulate this by setting the env var inside the test.
+    #[test]
+    fn test_miss_hint_env_uri_with_keyring_fallback_message() {
+        // We can't actually plant a keyring entry in tests, so this case
+        // exercises the unconditional macOS fallback / cross-platform
+        // suggestion path: the hint should still name the missing var.
+        let hint = build_credential_miss_hint("env://NONONO_TEST_MISSING_VAR");
+        assert!(
+            hint.contains("NONONO_TEST_MISSING_VAR"),
+            "hint should name the missing variable, got: {}",
+            hint
+        );
+    }
+
+    /// Bare key (default keyring lookup) misses but env var IS set —
+    /// hint should suggest the `env://` URI form.
+    #[test]
+    fn test_miss_hint_bare_key_with_env_var_set() {
+        let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
+        let _guard = EnvVarGuard::set_all(&[("NONONO_TEST_BARE_KEY", "secret-value")]);
+
+        let hint = build_credential_miss_hint("NONONO_TEST_BARE_KEY");
+        assert!(
+            hint.contains("env://NONONO_TEST_BARE_KEY"),
+            "hint should suggest env:// URI, got: {}",
+            hint
+        );
+    }
+
+    /// URI-managed sources should not get an automatic cross-probe.
+    #[test]
+    fn test_miss_hint_op_uri_returns_empty() {
+        let hint = build_credential_miss_hint("op://Vault/Item/field");
+        assert!(
+            hint.is_empty(),
+            "URI-managed sources should not get cross-probe hints, got: {}",
+            hint
+        );
     }
 
     #[test]

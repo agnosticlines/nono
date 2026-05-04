@@ -19,11 +19,12 @@ use crate::config::InjectMode;
 use crate::credential::{CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
+use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -31,9 +32,6 @@ use zeroize::Zeroizing;
 
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
-
-/// Timeout for upstream TCP connect.
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
 ///
@@ -256,66 +254,36 @@ pub async fn handle_reverse_proxy(
     }
     request.push_str("\r\n");
 
-    let status_code = match upstream_scheme {
-        UpstreamScheme::Https => {
-            let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
-            let mut tls_stream = match connect_upstream_tls(
-                &upstream_host,
-                upstream_port,
-                &check.resolved_addrs,
-                connector,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Upstream connection failed: {}", e);
-                    send_error(stream, 502, "Bad Gateway").await?;
-                    audit::log_denied(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        &service,
-                        0,
-                        &e.to_string(),
-                    );
-                    return Ok(());
-                }
-            };
-
-            write_upstream_request(&mut tls_stream, &request, &body).await?;
-            stream_response(&mut tls_stream, stream).await?
-        }
-        UpstreamScheme::Http => {
-            let mut upstream_stream =
-                match connect_upstream_tcp(&upstream_host, upstream_port, &check.resolved_addrs)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Upstream connection failed: {}", e);
-                        send_error(stream, 502, "Bad Gateway").await?;
-                        audit::log_denied(
-                            ctx.audit_log,
-                            audit::ProxyMode::Reverse,
-                            &service,
-                            0,
-                            &e.to_string(),
-                        );
-                        return Ok(());
-                    }
-                };
-
-            write_upstream_request(&mut upstream_stream, &request, &body).await?;
-            stream_response(&mut upstream_stream, stream).await?
-        }
+    let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
+    let upstream_spec = UpstreamSpec {
+        scheme: upstream_scheme,
+        host: &upstream_host,
+        port: upstream_port,
+        strategy: UpstreamStrategy::Direct {
+            resolved_addrs: &check.resolved_addrs,
+        },
+        tls_connector: connector,
     };
-    audit::log_reverse_proxy(
-        ctx.audit_log,
-        &service,
-        &method,
-        &upstream_path,
-        status_code,
-    );
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::Reverse,
+        target: &service,
+        method: &method,
+        path: &upstream_path,
+    };
+    if let Err(e) =
+        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    {
+        warn!("Upstream connection failed: {}", e);
+        send_error(stream, 502, "Bad Gateway").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &service,
+            0,
+            &e.to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -429,87 +397,55 @@ async fn handle_oauth2_credential(
     }
     request.push_str("\r\n");
 
-    let status_code = match upstream_scheme {
-        UpstreamScheme::Https => {
-            let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
-            let mut tls_stream = match connect_upstream_tls(
-                &upstream_host,
-                upstream_port,
-                &check.resolved_addrs,
-                connector,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Upstream connection failed: {}", e);
-                    send_error(stream, 502, "Bad Gateway").await?;
-                    audit::log_denied(
-                        ctx.audit_log,
-                        audit::ProxyMode::Reverse,
-                        service,
-                        0,
-                        &e.to_string(),
-                    );
-                    return Ok(());
-                }
-            };
-
-            write_upstream_request(&mut tls_stream, &request, &body).await?;
-            stream_response(&mut tls_stream, stream).await?
-        }
-        UpstreamScheme::Http => {
-            let mut upstream_stream =
-                match connect_upstream_tcp(&upstream_host, upstream_port, &check.resolved_addrs)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Upstream connection failed: {}", e);
-                        send_error(stream, 502, "Bad Gateway").await?;
-                        audit::log_denied(
-                            ctx.audit_log,
-                            audit::ProxyMode::Reverse,
-                            service,
-                            0,
-                            &e.to_string(),
-                        );
-                        return Ok(());
-                    }
-                };
-
-            write_upstream_request(&mut upstream_stream, &request, &body).await?;
-            stream_response(&mut upstream_stream, stream).await?
-        }
+    let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
+    let upstream_spec = UpstreamSpec {
+        scheme: upstream_scheme,
+        host: &upstream_host,
+        port: upstream_port,
+        strategy: UpstreamStrategy::Direct {
+            resolved_addrs: &check.resolved_addrs,
+        },
+        tls_connector: connector,
     };
-
-    audit::log_reverse_proxy(ctx.audit_log, service, method, upstream_path, status_code);
-    Ok(())
-}
-
-async fn write_upstream_request<S>(stream: &mut S, request: &str, body: &[u8]) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    stream.write_all(request.as_bytes()).await?;
-    if !body.is_empty() {
-        stream.write_all(body).await?;
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::Reverse,
+        target: service,
+        method,
+        path: upstream_path,
+    };
+    if let Err(e) =
+        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    {
+        warn!("Upstream connection failed: {}", e);
+        send_error(stream, 502, "Bad Gateway").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &e.to_string(),
+        );
     }
-    stream.flush().await?;
     Ok(())
 }
 
 /// Read request body from the client stream with size limit.
 ///
 /// `buffered_body` contains bytes the BufReader read ahead beyond headers.
-async fn read_request_body(
-    stream: &mut TcpStream,
+/// Generic over the inbound stream so the TLS-intercept handler can reuse
+/// it on a `TlsStream<…>` without duplication.
+pub(crate) async fn read_request_body<S>(
+    stream: &mut S,
     content_length: Option<usize>,
     buffered_body: &[u8],
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     if let Some(len) = content_length {
         if len > MAX_REQUEST_BODY {
-            send_error(stream, 413, "Payload Too Large").await?;
+            send_error_generic(stream, 413, "Payload Too Large").await?;
             return Ok(None);
         }
         let mut buf = Vec::with_capacity(len);
@@ -527,37 +463,22 @@ async fn read_request_body(
     }
 }
 
-/// Stream the upstream TLS response back to the client.
-///
-/// Returns the HTTP status code parsed from the first chunk.
-async fn stream_response<S>(tls_stream: &mut S, stream: &mut TcpStream) -> Result<u16>
+/// Generic equivalent of `send_error` used by [`read_request_body`].
+pub(crate) async fn send_error_generic<S>(stream: &mut S, status: u16, reason: &str) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: tokio::io::AsyncWrite + Unpin,
 {
-    let mut response_buf = [0u8; 8192];
-    let mut status_code: u16 = 502;
-    let mut first_chunk = true;
-
-    loop {
-        let n = match tls_stream.read(&mut response_buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                debug!("Upstream read error: {}", e);
-                break;
-            }
-        };
-
-        if first_chunk {
-            status_code = parse_response_status(&response_buf[..n]);
-            first_chunk = false;
-        }
-
-        stream.write_all(&response_buf[..n]).await?;
-        stream.flush().await?;
-    }
-
-    Ok(status_code)
+    let body = format!("{{\"error\":\"{}\"}}", reason);
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Parse an HTTP request line into (method, path, version).
@@ -645,7 +566,7 @@ fn validate_phantom_token(
 /// the phantom token that must not be forwarded alongside the real credential).
 /// When `cred_header` is empty (no-credential route), all other headers
 /// including `Authorization` are passed through to the upstream.
-fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
+pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
     let cred_header_lower = if cred_header.is_empty() {
         String::new()
@@ -674,7 +595,7 @@ fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String
 }
 
 /// Extract Content-Length value from raw headers.
-fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
+pub(crate) fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
     let header_str = std::str::from_utf8(header_bytes).ok()?;
     for line in header_str.lines() {
         if line.to_lowercase().starts_with("content-length:") {
@@ -683,13 +604,6 @@ fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-/// Parse an upstream URL into (host, port, path).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpstreamScheme {
-    Http,
-    Https,
 }
 
 fn validate_http_upstream_target(
@@ -723,7 +637,7 @@ fn is_local_only_target(host: &str, resolved_addrs: &[SocketAddr]) -> bool {
     }
 }
 
-fn format_host_header(scheme: UpstreamScheme, host: &str, port: u16) -> String {
+pub(crate) fn format_host_header(scheme: UpstreamScheme, host: &str, port: u16) -> String {
     let default_port = match scheme {
         UpstreamScheme::Http => 80,
         UpstreamScheme::Https => 443,
@@ -785,135 +699,6 @@ fn parse_upstream_url(url_str: &str) -> Result<(UpstreamScheme, String, u16, Str
     Ok((scheme, host, port, path_with_query))
 }
 
-/// Connect to an upstream host over TLS using pre-resolved addresses.
-///
-/// Uses the pre-resolved `SocketAddr`s from the filter check to prevent
-/// DNS rebinding TOCTOU. Falls back to hostname resolution only if no
-/// pre-resolved addresses are available.
-///
-/// The `TlsConnector` is shared across all connections (created once at
-/// server startup with the system root certificate store).
-async fn connect_upstream_tls(
-    host: &str,
-    port: u16,
-    resolved_addrs: &[SocketAddr],
-    connector: &TlsConnector,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = if resolved_addrs.is_empty() {
-        // Fallback: no pre-resolved addresses (shouldn't happen in practice)
-        let addr = format!("{}:{}", host, port);
-        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(ProxyError::UpstreamConnect {
-                    host: host.to_string(),
-                    reason: e.to_string(),
-                });
-            }
-            Err(_) => {
-                return Err(ProxyError::UpstreamConnect {
-                    host: host.to_string(),
-                    reason: "connection timed out".to_string(),
-                });
-            }
-        }
-    } else {
-        connect_to_resolved(resolved_addrs, host).await?
-    };
-
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
-        ProxyError::UpstreamConnect {
-            host: host.to_string(),
-            reason: "invalid server name for TLS".to_string(),
-        }
-    })?;
-
-    let tls_stream =
-        connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| ProxyError::UpstreamConnect {
-                host: host.to_string(),
-                reason: format!("TLS handshake failed: {}", e),
-            })?;
-
-    Ok(tls_stream)
-}
-
-async fn connect_upstream_tcp(
-    host: &str,
-    port: u16,
-    resolved_addrs: &[SocketAddr],
-) -> Result<TcpStream> {
-    if resolved_addrs.is_empty() {
-        let addr = format!("{}:{}", host, port);
-        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
-            Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(ProxyError::UpstreamConnect {
-                host: host.to_string(),
-                reason: e.to_string(),
-            }),
-            Err(_) => Err(ProxyError::UpstreamConnect {
-                host: host.to_string(),
-                reason: "connection timed out".to_string(),
-            }),
-        }
-    } else {
-        connect_to_resolved(resolved_addrs, host).await
-    }
-}
-
-/// Connect to one of the pre-resolved socket addresses with timeout.
-async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStream> {
-    let mut last_err = None;
-    for addr in addrs {
-        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(e)) => {
-                debug!("Connect to {} failed: {}", addr, e);
-                last_err = Some(e.to_string());
-            }
-            Err(_) => {
-                debug!("Connect to {} timed out", addr);
-                last_err = Some("connection timed out".to_string());
-            }
-        }
-    }
-    Err(ProxyError::UpstreamConnect {
-        host: host.to_string(),
-        reason: last_err.unwrap_or_else(|| "no addresses to connect to".to_string()),
-    })
-}
-
-/// Parse HTTP status code from the first response chunk.
-///
-/// Looks for the "HTTP/x.y NNN" pattern in the first line. Returns 502
-/// if the response doesn't contain a valid status line (upstream sent
-/// garbage or incomplete data).
-fn parse_response_status(data: &[u8]) -> u16 {
-    // Find the end of the first line (or use full data if no newline)
-    let line_end = data
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .unwrap_or(data.len());
-    let first_line = &data[..line_end.min(64)];
-
-    if let Ok(line) = std::str::from_utf8(first_line) {
-        // Split on whitespace: ["HTTP/1.1", "200", "OK"]
-        let mut parts = line.split_whitespace();
-        if let Some(version) = parts.next() {
-            if version.starts_with("HTTP/") {
-                if let Some(code_str) = parts.next() {
-                    if code_str.len() == 3 {
-                        return code_str.parse().unwrap_or(502);
-                    }
-                }
-            }
-        }
-    }
-    502
-}
-
 /// Send an HTTP error response.
 async fn send_error(stream: &mut TcpStream, status: u16, reason: &str) -> Result<()> {
     let body = format!("{{\"error\":\"{}\"}}", reason);
@@ -939,7 +724,7 @@ async fn send_error(stream: &mut TcpStream, status: u16, reason: &str) -> Result
 /// - `Header`/`BasicAuth`: From the auth header (Authorization, x-api-key, etc.)
 /// - `UrlPath`: From the URL path pattern (e.g., `/bot<token>/getMe`)
 /// - `QueryParam`: From the query parameter (e.g., `?api_key=<token>`)
-fn validate_phantom_token_for_mode(
+pub(crate) fn validate_phantom_token_for_mode(
     mode: &InjectMode,
     header_bytes: &[u8],
     path: &str,
@@ -1053,7 +838,7 @@ fn validate_phantom_token_in_query(
 /// - `UrlPath`: Replace phantom token with real credential in path
 /// - `QueryParam`: Add/replace query parameter with real credential
 /// - `Header`/`BasicAuth`: No path transformation needed
-fn transform_path_for_mode(
+pub(crate) fn transform_path_for_mode(
     mode: &InjectMode,
     path: &str,
     path_pattern: Option<&str>,
@@ -1204,7 +989,7 @@ fn transform_query_param(
 ///
 /// When both modes are the same, the upstream transform handles replacement
 /// (phantom → real credential), so no stripping is needed.
-fn strip_proxy_artifacts(
+pub(crate) fn strip_proxy_artifacts(
     path: &str,
     proxy_mode: &InjectMode,
     upstream_mode: &InjectMode,
@@ -1324,7 +1109,7 @@ fn strip_proxy_query_param(path: &str, param_name: &str) -> String {
 ///
 /// For header/basic_auth modes, adds the credential header.
 /// For url_path/query_param modes, the credential is already in the path.
-fn inject_credential_for_mode(cred: &LoadedCredential, request: &mut Zeroizing<String>) {
+pub(crate) fn inject_credential_for_mode(cred: &LoadedCredential, request: &mut Zeroizing<String>) {
     match cred.inject_mode {
         InjectMode::Header | InjectMode::BasicAuth => {
             // Inject credential header
@@ -1546,34 +1331,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_response_status_200() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
-        assert_eq!(parse_response_status(data), 200);
-    }
-
-    #[test]
-    fn test_parse_response_status_404() {
-        let data = b"HTTP/1.1 404 Not Found\r\n\r\n";
-        assert_eq!(parse_response_status(data), 404);
-    }
-
-    #[test]
-    fn test_parse_response_status_garbage() {
-        let data = b"not an http response";
-        assert_eq!(parse_response_status(data), 502);
-    }
-
-    #[test]
-    fn test_parse_response_status_empty() {
-        assert_eq!(parse_response_status(b""), 502);
-    }
-
-    #[test]
-    fn test_parse_response_status_partial() {
-        let data = b"HTTP/1.1 ";
-        assert_eq!(parse_response_status(data), 502);
-    }
+    // Status-line parsing moved to `crate::forward` along with the upstream
+    // response-streaming pipeline; coverage continues there.
 
     // ============================================================================
     // URL Path Injection Mode Tests

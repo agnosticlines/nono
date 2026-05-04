@@ -18,8 +18,11 @@ pub type SharedAuditLog = Arc<Mutex<Vec<NetworkAuditEvent>>>;
 /// Proxy mode for audit logging.
 #[derive(Debug, Clone, Copy)]
 pub enum ProxyMode {
-    /// CONNECT tunnel (host filtering only)
+    /// CONNECT tunnel (host filtering only, no L7 visibility)
     Connect,
+    /// CONNECT tunnel that the proxy terminated locally for L7 inspection
+    /// and/or credential injection.
+    ConnectIntercept,
     /// Reverse proxy (credential injection)
     Reverse,
     /// External proxy passthrough (enterprise)
@@ -30,6 +33,7 @@ impl std::fmt::Display for ProxyMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProxyMode::Connect => write!(f, "connect"),
+            ProxyMode::ConnectIntercept => write!(f, "connect_intercept"),
             ProxyMode::Reverse => write!(f, "reverse"),
             ProxyMode::External => write!(f, "external"),
         }
@@ -81,6 +85,7 @@ fn now_unix_millis() -> u64 {
 fn map_mode(mode: ProxyMode) -> NetworkAuditMode {
     match mode {
         ProxyMode::Connect => NetworkAuditMode::Connect,
+        ProxyMode::ConnectIntercept => NetworkAuditMode::ConnectIntercept,
         ProxyMode::Reverse => NetworkAuditMode::Reverse,
         ProxyMode::External => NetworkAuditMode::External,
     }
@@ -179,31 +184,36 @@ pub fn log_denied(
     );
 }
 
-/// Log a reverse proxy request with service info.
-pub fn log_reverse_proxy(
+/// Log an L7 request that the proxy decoded (reverse proxy or intercepted CONNECT).
+///
+/// Used for both `Reverse` and `ConnectIntercept` modes. `External` and
+/// `Connect` (transparent tunnel) modes have no L7 visibility and use
+/// `log_allowed`/`log_denied` instead.
+pub fn log_l7_request(
     audit_log: Option<&SharedAuditLog>,
-    service: &str,
+    mode: ProxyMode,
+    target: &str,
     method: &str,
     path: &str,
     status: u16,
 ) {
     info!(
         target: "nono_proxy::audit",
-        mode = "reverse",
-        service = service,
+        mode = %mode,
+        target = target,
         method = method,
         path = path,
         status = status,
-        "reverse proxy response"
+        "l7 proxy response"
     );
 
     push_event(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
-            mode: NetworkAuditMode::Reverse,
+            mode: map_mode(mode),
             decision: NetworkAuditDecision::Allow,
-            target: service.to_string(),
+            target: target.to_string(),
             port: None,
             method: Some(method.to_string()),
             path: Some(path.to_string()),
@@ -211,6 +221,19 @@ pub fn log_reverse_proxy(
             reason: None,
         },
     );
+}
+
+/// Compatibility shim for the previous `log_reverse_proxy` API. New code
+/// should call [`log_l7_request`] directly with the appropriate
+/// [`ProxyMode`] instead.
+pub fn log_reverse_proxy(
+    audit_log: Option<&SharedAuditLog>,
+    service: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+) {
+    log_l7_request(audit_log, ProxyMode::Reverse, service, method, path, status);
 }
 
 #[cfg(test)]

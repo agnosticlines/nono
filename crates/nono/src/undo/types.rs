@@ -173,11 +173,16 @@ pub struct Change {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAuditMode {
-    /// CONNECT tunnel request
+    /// CONNECT tunnel request — opaque TLS pipe, no L7 visibility.
     Connect,
-    /// Reverse proxy request
+    /// CONNECT tunnel that the proxy terminated locally for L7 inspection
+    /// or credential injection. The agent's TLS handshake against an
+    /// ephemeral leaf certificate succeeded; per-request L7 events follow.
+    ConnectIntercept,
+    /// Reverse proxy request — agent uses the proxy's `BASE_URL` directly.
     Reverse,
-    /// External proxy passthrough request
+    /// External proxy passthrough request — chained through an enterprise
+    /// (corporate) HTTP proxy.
     External,
 }
 
