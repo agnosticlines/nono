@@ -45,9 +45,7 @@ Most sandboxes feel like sandboxes. Rigid, sluggish, and designed for a differen
 
 ## Latest News
 
-- **nono registry** - we will be bringing online a skill and policy registry to allow uses to contribute agent skills (SKILLS.md, hooks, scripts etc), and policy - this will allow us to more easily scale to supporting all of the different agents, installers and linux dists. Security will be baked in from the start. [Read more here](https://github.com/always-further/nono/issues/630)
-
-- **WSL2 support** -- Auto-detection with ~84% feature coverage out of the box. Run `nono setup --check-only` to see what's available. ([#522](https://github.com/always-further/nono/pull/522))
+- **nono registry** - the nono registry is in alpha and available to try. Host your skills, hooks, policy and more in your own repo, and securely host via our registry - this then gives you the ability to `nono pull org/repo` your agent skills and sandbox policies direct into the nono runtime! Check out the registry at: https://registry.nono.sh 
 
 [All updates](https://github.com/always-further/nono/discussions/categories/announcements)
 
