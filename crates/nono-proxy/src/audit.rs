@@ -261,6 +261,7 @@ pub fn log_l7_request(
 /// Compatibility shim for the previous `log_reverse_proxy` API. New code
 /// should call [`log_l7_request`] directly with the appropriate
 /// [`ProxyMode`] instead.
+#[deprecated(since = "0.46.0", note = "use log_l7_request with ProxyMode::Reverse")]
 pub fn log_reverse_proxy(
     audit_log: Option<&SharedAuditLog>,
     service: &str,

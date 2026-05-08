@@ -12,6 +12,7 @@
 
 use crate::config::{CompiledEndpointRules, RouteConfig};
 use crate::error::{ProxyError, Result};
+use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,6 +55,14 @@ pub struct LoadedRoute {
     /// this specifically captures whether the proxy must supply upstream
     /// authentication itself rather than accept agent-provided credentials.
     pub requires_managed_credential: bool,
+
+    /// Audit auth mechanism implied by the managed credential configuration.
+    /// Kept even if credential material failed to load so fail-closed denial
+    /// events can describe what auth shape the route expected.
+    pub managed_auth_mechanism: Option<NetworkAuditAuthMechanism>,
+
+    /// Audit injection mode implied by the managed credential configuration.
+    pub managed_injection_mode: Option<NetworkAuditInjectionMode>,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -68,8 +77,50 @@ impl std::fmt::Debug for LoadedRoute {
                 "requires_managed_credential",
                 &self.requires_managed_credential,
             )
+            .field("managed_auth_mechanism", &self.managed_auth_mechanism)
+            .field("managed_injection_mode", &self.managed_injection_mode)
             .finish()
     }
+}
+
+fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMechanism> {
+    if route.oauth2.is_some() {
+        return Some(NetworkAuditAuthMechanism::PhantomHeader);
+    }
+
+    if route.credential_key.is_some() {
+        let proxy_mode = route
+            .proxy
+            .as_ref()
+            .and_then(|p| p.inject_mode.clone())
+            .unwrap_or_else(|| route.inject_mode.clone());
+        return Some(match proxy_mode {
+            crate::config::InjectMode::Header | crate::config::InjectMode::BasicAuth => {
+                NetworkAuditAuthMechanism::PhantomHeader
+            }
+            crate::config::InjectMode::UrlPath => NetworkAuditAuthMechanism::PhantomPath,
+            crate::config::InjectMode::QueryParam => NetworkAuditAuthMechanism::PhantomQuery,
+        });
+    }
+
+    None
+}
+
+fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjectionMode> {
+    if route.oauth2.is_some() {
+        return Some(NetworkAuditInjectionMode::OAuth2);
+    }
+
+    if route.credential_key.is_some() {
+        return Some(match route.inject_mode {
+            crate::config::InjectMode::Header => NetworkAuditInjectionMode::Header,
+            crate::config::InjectMode::UrlPath => NetworkAuditInjectionMode::UrlPath,
+            crate::config::InjectMode::QueryParam => NetworkAuditInjectionMode::QueryParam,
+            crate::config::InjectMode::BasicAuth => NetworkAuditInjectionMode::BasicAuth,
+        });
+    }
+
+    None
 }
 
 /// Store of all configured routes, keyed by normalised prefix.
@@ -133,6 +184,8 @@ impl RouteStore {
                 route.credential_key.is_some() || route.oauth2.is_some();
             let requires_intercept =
                 requires_managed_credential || !route.endpoint_rules.is_empty();
+            let managed_auth_mechanism = auth_mechanism_for_route(route);
+            let managed_injection_mode = injection_mode_for_route(route);
 
             loaded.insert(
                 normalized_prefix,
@@ -143,6 +196,8 @@ impl RouteStore {
                     tls_connector,
                     requires_intercept,
                     requires_managed_credential,
+                    managed_auth_mechanism,
+                    managed_injection_mode,
                 },
             );
         }
@@ -631,12 +686,16 @@ mod tests {
             tls_connector: None,
             requires_intercept: false,
             requires_managed_credential: false,
+            managed_auth_mechanism: None,
+            managed_injection_mode: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
         assert!(debug_output.contains("has_custom_tls_ca"));
         assert!(debug_output.contains("requires_intercept"));
         assert!(debug_output.contains("requires_managed_credential"));
+        assert!(debug_output.contains("managed_auth_mechanism"));
+        assert!(debug_output.contains("managed_injection_mode"));
     }
 
     #[test]
@@ -663,6 +722,14 @@ mod tests {
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
         assert!(store.has_intercept_route("api.openai.com:443"));
         assert!(hit.1.requires_managed_credential);
+        assert_eq!(
+            hit.1.managed_auth_mechanism,
+            Some(NetworkAuditAuthMechanism::PhantomHeader)
+        );
+        assert_eq!(
+            hit.1.managed_injection_mode,
+            Some(NetworkAuditInjectionMode::Header)
+        );
         assert!(!store.has_intercept_route("api.example.com:443"));
     }
 
@@ -735,6 +802,8 @@ mod tests {
             tls_connector: None,
             requires_intercept: true,
             requires_managed_credential: true,
+            managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
+            managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
         };
         assert!(managed.missing_managed_credential(false, false));
         assert!(!managed.missing_managed_credential(true, false));
@@ -747,6 +816,8 @@ mod tests {
             tls_connector: None,
             requires_intercept: true,
             requires_managed_credential: false,
+            managed_auth_mechanism: None,
+            managed_injection_mode: None,
         };
         assert!(!l7_only.missing_managed_credential(false, false));
     }

@@ -5,7 +5,7 @@ use crate::sandbox_prepare::{validate_external_proxy_bypass, PreparedSandbox};
 #[cfg(not(target_os = "macos"))]
 use nono::AccessMode;
 use nono::{CapabilitySet, NonoError, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 pub(crate) struct ActiveProxyRuntime {
@@ -347,12 +347,25 @@ fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
         );
         return Ok(None);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
+    set_intercept_ca_dir_permissions(&dir)?;
     Ok(Some(dir))
+}
+
+#[cfg(unix)]
+fn set_intercept_ca_dir_permissions(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "failed to set owner-only permissions on TLS-intercept dir '{}': {e}",
+            dir.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn set_intercept_ca_dir_permissions(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Read the parent process's `SSL_CERT_FILE`, if set, so any corporate
@@ -383,5 +396,27 @@ fn read_parent_ssl_cert_file() -> Option<Vec<u8>> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn set_intercept_ca_dir_permissions_fails_closed() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let missing = tmp.path().join("missing");
+
+        let err = set_intercept_ca_dir_permissions(&missing)
+            .err()
+            .ok_or_else(|| {
+                NonoError::SandboxInit("expected missing intercept dir to fail".to_string())
+            })?;
+
+        assert!(matches!(err, NonoError::SandboxInit(_)));
+        assert!(err.to_string().contains("TLS-intercept dir"));
+        Ok(())
     }
 }

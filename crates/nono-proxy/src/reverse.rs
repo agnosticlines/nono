@@ -161,11 +161,13 @@ pub async fn handle_reverse_proxy(
         warn!("{}", reason);
         let deny_ctx = audit::EventContext {
             route_id: Some(&service),
+            auth_mechanism: route.managed_auth_mechanism.clone(),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
             managed_credential_active: Some(false),
+            injection_mode: route.managed_injection_mode.clone(),
             denial_category: Some(
                 nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
             ),
-            ..audit::EventContext::default()
         };
         audit::log_denied(
             ctx.audit_log,
