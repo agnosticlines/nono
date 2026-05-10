@@ -32,7 +32,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   wrap       Apply sandbox and exec into command (nono disappears)
 
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
-  learn      Trace a command to discover required filesystem paths
+  learn      [deprecated] Use `nono run` to learn from sandbox denials
   why        Check why a path or network operation would be allowed or denied
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
@@ -175,7 +175,8 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Trace a command to discover required filesystem paths
+    /// [deprecated] Use `nono run` to learn from sandbox denials
+    /// DEPRECATED(canonical="nono run", introduced="v0.50.1", remove_by="v1.0.0", issue="#445")
     #[command(trailing_var_arg = true)]
     #[command(help_template = "\
 {about}
@@ -185,15 +186,20 @@ pub enum Commands {
 
 {all-args}
 {after-help}")]
-    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono learn -- my-app                         # Discover paths needed by a command
-  nono learn --profile my-profile -- my-app    # Compare against an existing profile
+    #[command(after_help = "\x1b[1mDEPRECATED\x1b[0m
+  Use `nono run --profile <name> -- <command>` instead. `nono run` keeps the
+  command sandboxed, reports denials, and offers to save profile updates.
+
+\x1b[1mEXAMPLES\x1b[0m
+  nono run --profile my-profile -- my-app      # Preferred learning workflow
+  nono learn --profile my-profile -- my-app    # Deprecated compatibility path
   nono learn --json -- node server.js          # Output as JSON for profile
   nono learn --timeout 30 -- my-app            # Limit trace duration
 
 \x1b[1mPLATFORM NOTES\x1b[0m
   Linux   Uses strace (install with: apt install strace)
-  macOS   Uses fs_usage (requires sudo)
+  macOS   Prefer: nono run --profile <name> -- <command>
+          Legacy unsandboxed fs_usage/nettop tracing: nono learn --trace -- <command>
 ")]
     Learn(Box<LearnArgs>),
 
@@ -496,7 +502,8 @@ IN-BAND DETACH:
   nono profile list                            # List all profiles (built-in and user)
   nono profile show claude-code                # Show a fully resolved profile
   nono profile diff default claude-code        # Compare two profiles
-  nono profile validate ~/my-profile.json      # Validate a user profile file
+  nono profile validate my-agent               # Validate a profile by name
+  nono profile validate ~/my-profile.json      # Validate a profile file
   nono profile validate --draft my-profile     # Validate a profile draft
   nono profile promote my-profile              # Review and apply a profile draft
   nono profile groups                          # List all policy groups
@@ -1715,6 +1722,10 @@ pub struct LearnArgs {
     /// Skip reverse DNS lookups for discovered IPs
     #[arg(long, help_heading = "OPTIONS")]
     pub no_rdns: bool,
+
+    /// On macOS, use legacy unsandboxed fs_usage/nettop tracing
+    #[arg(long, help_heading = "OPTIONS")]
+    pub trace: bool,
 
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
