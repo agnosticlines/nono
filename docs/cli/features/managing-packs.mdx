@@ -54,6 +54,16 @@ nono pull always-further/claude --force
   `--force` bypasses the signer-change prompt. Only use this when you trust the new signer identity.
 </Warning>
 
+## Inline Update Hints
+
+When you run `nono run --profile <name>`, nono checks whether any pack in the active profile's extends chain has a newer version available and prints a one-line hint if so:
+
+```
+  update available  always-further/claude  0.0.12 → 0.0.13   run: nono update
+```
+
+Results are cached for 24 hours so the check never blocks startup. A background thread refreshes stale entries for the next run. The hint respects the same opt-out as the CLI update check: set `NONO_NO_UPDATE_CHECK=1` or `[updates] check = false` in `~/.config/nono/config.toml` to suppress it.
+
 ## Checking for Updates
 
 See which installed packs have newer versions available:

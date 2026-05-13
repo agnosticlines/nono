@@ -69,10 +69,10 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
                     < CHECK_INTERVAL_SECS =>
             {
                 // Cache is fresh — use it.
-                if let Some(ref latest) = entry.latest {
-                    if is_newer(installed, latest) {
-                        hints.push((pack_ref.clone(), installed.clone(), latest.clone()));
-                    }
+                if let Some(ref latest) = entry.latest
+                    && is_newer(installed, latest)
+                {
+                    hints.push((pack_ref.clone(), installed.clone(), latest.clone()));
                 }
             }
             _ => {
@@ -89,12 +89,11 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
             refresh_synchronous(&stale, &mut state);
             save_state(&state);
             for (pack_ref, installed) in &stale {
-                if let Some(entry) = state.entries.get(pack_ref) {
-                    if let Some(ref latest) = entry.latest {
-                        if is_newer(installed, latest) {
-                            hints.push((pack_ref.clone(), installed.clone(), latest.clone()));
-                        }
-                    }
+                if let Some(entry) = state.entries.get(pack_ref)
+                    && let Some(ref latest) = entry.latest
+                    && is_newer(installed, latest)
+                {
+                    hints.push((pack_ref.clone(), installed.clone(), latest.clone()));
                 }
             }
         } else {
@@ -136,12 +135,11 @@ fn collect_profile_packs(profile_name: &str) -> Vec<(String, String)> {
         if !visited.insert(name.clone()) {
             continue;
         }
-        if let Some(pack_ref) = pack_map.get(&name) {
-            if seen_packs.insert(pack_ref.clone()) {
-                if let Some(locked) = lockfile.packages.get(pack_ref) {
-                    result.push((pack_ref.clone(), locked.version.clone()));
-                }
-            }
+        if let Some(pack_ref) = pack_map.get(&name)
+            && seen_packs.insert(pack_ref.clone())
+            && let Some(locked) = lockfile.packages.get(pack_ref)
+        {
+            result.push((pack_ref.clone(), locked.version.clone()));
         }
         // Walk extends for all profiles, pack-provided or not, so a user
         // profile that extends a pack profile is handled correctly.
@@ -209,10 +207,8 @@ fn refresh_in_background(stale: Vec<(String, String)>, state: Arc<Mutex<PackHint
             }
         }
 
-        if changed {
-            if let Ok(guard) = state.lock() {
-                save_state(&*guard);
-            }
+        if changed && let Ok(guard) = state.lock() {
+            save_state(&guard);
         }
     });
 }
