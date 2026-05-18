@@ -3853,6 +3853,7 @@ mod tests {
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay — this is what we're testing
+                    &mut false,
                 );
 
                 #[cfg(not(target_os = "linux"))]
@@ -3967,6 +3968,7 @@ mod tests {
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay
+                    &mut false,
                 );
 
                 let (status, denials, ipc_denials) = result
