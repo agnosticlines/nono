@@ -1174,9 +1174,10 @@ fn load_from_bw(uri: &str) -> Result<Zeroizing<String>> {
         let field = segments[1];
         extract_bw_field(&raw, field, uri)
     } else {
-        Ok(Zeroizing::new(
-            raw.trim_end_matches(['\n', '\r']).to_string(),
-        ))
+        let mut raw = raw;
+        let trimmed_len = raw.trim_end_matches(['\n', '\r']).len();
+        raw.truncate(trimmed_len);
+        Ok(raw)
     }
 }
 
@@ -1199,29 +1200,32 @@ fn extract_bw_field(item_json: &str, field: &str, uri: &str) -> Result<Zeroizing
         ))
     })?;
 
-    let builtin: Option<&str> = match field {
-        "password" => item.login.as_ref().and_then(|l| l.password.as_deref()),
-        "username" => item.login.as_ref().and_then(|l| l.username.as_deref()),
-        "totp" => item.login.as_ref().and_then(|l| l.totp.as_deref()),
-        "notes" => item.notes.as_deref(),
+    let builtin: Option<Zeroizing<String>> = match field {
+        "password" => item.login.as_ref().and_then(|l| l.password.clone()),
+        "username" => item
+            .login
+            .as_ref()
+            .and_then(|l| l.username.as_ref().map(|s| Zeroizing::new(s.clone()))),
+        "totp" => item.login.as_ref().and_then(|l| l.totp.clone()),
+        "notes" => item.notes.clone(),
         "uri" => item
             .login
             .as_ref()
             .and_then(|l| l.uris.as_ref())
             .and_then(|uris| uris.first())
-            .and_then(|u| u.uri.as_deref()),
+            .and_then(|u| u.uri.as_ref().map(|s| Zeroizing::new(s.clone()))),
         _ => None,
     };
     if let Some(value) = builtin {
-        return Ok(Zeroizing::new(value.to_string()));
+        return Ok(value);
     }
 
     if let Some(fields) = &item.fields {
         for f in fields {
             if f.name.as_deref() == Some(field)
-                && let Some(value) = f.value.as_deref()
+                && let Some(value) = f.value.clone()
             {
-                return Ok(Zeroizing::new(value.to_string()));
+                return Ok(value);
             }
         }
     }
@@ -1239,7 +1243,7 @@ struct BwItem {
     #[serde(default)]
     login: Option<BwLogin>,
     #[serde(default)]
-    notes: Option<String>,
+    notes: Option<Zeroizing<String>>,
     #[serde(default)]
     fields: Option<Vec<BwCustomField>>,
 }
@@ -1247,11 +1251,11 @@ struct BwItem {
 #[derive(serde::Deserialize)]
 struct BwLogin {
     #[serde(default)]
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
-    totp: Option<String>,
+    totp: Option<Zeroizing<String>>,
     #[serde(default)]
     uris: Option<Vec<BwUriEntry>>,
 }
@@ -1267,7 +1271,7 @@ struct BwCustomField {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    value: Option<String>,
+    value: Option<Zeroizing<String>>,
 }
 
 /// Load a secret from Apple Passwords using macOS `security`.
