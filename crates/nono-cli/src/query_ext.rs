@@ -53,6 +53,8 @@ pub enum QueryResult {
         access: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        endpoint_rules: Option<Vec<crate::sandbox_state::EndpointRuleState>>,
     },
     /// The operation is denied
     #[serde(rename = "denied")]
@@ -166,6 +168,7 @@ pub fn query_path(
             granted_path: Some(cap.resolved.display().to_string()),
             access: Some(cap.access.to_string()),
             source: Some(cap.source.to_string()),
+            endpoint_rules: None,
         });
     }
 
@@ -212,6 +215,7 @@ pub fn query_network(
     port: u16,
     caps: &CapabilitySet,
     allowed_domains: &[String],
+    domain_endpoints: &[crate::sandbox_state::DomainEndpointState],
 ) -> QueryResult {
     match caps.network_mode() {
         nono::NetworkMode::Blocked => QueryResult::Denied {
@@ -232,25 +236,49 @@ pub fn query_network(
             };
             // Pass empty IPs: DNS resolution happens at proxy time, not query time.
             match filter.check_host(host, &[]) {
-                nono::net_filter::FilterResult::Allow => QueryResult::Allowed {
-                    reason: "proxy_allowed".to_string(),
-                    granted_path: None,
-                    access: Some(format!(
-                        "Connection to {}:{} would be allowed via proxy{}",
-                        host,
-                        port,
-                        if allowed_domains.is_empty() {
-                            " (no domain filter)"
+                nono::net_filter::FilterResult::Allow => {
+                    let matching_endpoints = domain_endpoints
+                        .iter()
+                        .find(|de| de.domain.eq_ignore_ascii_case(host));
+
+                    let (access_msg, rules) = match matching_endpoints {
+                        Some(de) => (
+                            format!(
+                                "Connection to {}:{} allowed via proxy \
+                                 (restricted to {} endpoint rules)",
+                                host,
+                                port,
+                                de.endpoints.len(),
+                            ),
+                            Some(de.endpoints.clone()),
+                        ),
+                        None => (
+                            format!(
+                                "Connection to {}:{} would be allowed via proxy{}",
+                                host,
+                                port,
+                                if allowed_domains.is_empty() {
+                                    " (no domain filter)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            None,
+                        ),
+                    };
+
+                    QueryResult::Allowed {
+                        reason: "proxy_allowed".to_string(),
+                        granted_path: None,
+                        access: Some(access_msg),
+                        source: Some(if allowed_domains.is_empty() {
+                            "proxy".to_string()
                         } else {
-                            ""
-                        }
-                    )),
-                    source: Some(if allowed_domains.is_empty() {
-                        "proxy".to_string()
-                    } else {
-                        "domain allowlist".to_string()
-                    }),
-                },
+                            "domain allowlist".to_string()
+                        }),
+                        endpoint_rules: rules,
+                    }
+                }
                 deny => QueryResult::Denied {
                     reason: "proxy_filtered".to_string(),
                     details: Some(format!("Domain filtering is active. {}", deny.reason())),
@@ -265,6 +293,7 @@ pub fn query_network(
             granted_path: None,
             access: Some(format!("Connection to {}:{} would be allowed", host, port)),
             source: None,
+            endpoint_rules: None,
         },
     }
 }
@@ -362,6 +391,7 @@ pub fn print_result(result: &QueryResult) {
             granted_path,
             access,
             source,
+            endpoint_rules,
         } => {
             println!("{}", "ALLOWED".green().bold());
             println!("  Reason: {}", reason);
@@ -373,6 +403,12 @@ pub fn print_result(result: &QueryResult) {
             }
             if let Some(src) = source {
                 println!("  Source: {}", src);
+            }
+            if let Some(rules) = endpoint_rules {
+                println!("  Endpoint rules ({} total):", rules.len());
+                for rule in rules {
+                    println!("    {} {}", rule.method, rule.path);
+                }
             }
         }
         QueryResult::Denied {
@@ -652,14 +688,14 @@ mod tests {
     #[test]
     fn test_query_network_allowed() {
         let caps = CapabilitySet::new();
-        let result = query_network("example.com", 443, &caps, &[]);
+        let result = query_network("example.com", 443, &caps, &[], &[]);
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
 
     #[test]
     fn test_query_network_blocked() {
         let caps = CapabilitySet::new().block_network();
-        let result = query_network("example.com", 443, &caps, &[]);
+        let result = query_network("example.com", 443, &caps, &[], &[]);
         assert!(matches!(result, QueryResult::Denied { .. }));
     }
 
@@ -691,10 +727,10 @@ mod tests {
         });
         let allowed = vec!["api.example.com".to_string()];
 
-        let result = query_network("api.example.com", 443, &caps, &allowed);
+        let result = query_network("api.example.com", 443, &caps, &allowed, &[]);
         assert!(matches!(result, QueryResult::Allowed { .. }));
 
-        match query_network("evil.com", 443, &caps, &allowed) {
+        match query_network("evil.com", 443, &caps, &allowed, &[]) {
             QueryResult::Denied {
                 reason,
                 suggested_flag,
@@ -716,12 +752,12 @@ mod tests {
         let allowed = vec!["*.example.com".to_string()];
 
         assert!(matches!(
-            query_network("sub.example.com", 443, &caps, &allowed),
+            query_network("sub.example.com", 443, &caps, &allowed, &[]),
             QueryResult::Allowed { .. }
         ));
         // *.example.com must NOT match bare example.com (mirrors HostFilter)
         assert!(matches!(
-            query_network("example.com", 443, &caps, &allowed),
+            query_network("example.com", 443, &caps, &allowed, &[]),
             QueryResult::Denied { .. }
         ));
     }
@@ -733,7 +769,7 @@ mod tests {
             bind_ports: vec![],
         });
         assert!(matches!(
-            query_network("anything.com", 443, &caps, &[]),
+            query_network("anything.com", 443, &caps, &[], &[]),
             QueryResult::Allowed { .. }
         ));
     }
@@ -746,13 +782,13 @@ mod tests {
         });
         // Cloud metadata endpoints are denied even with an empty allowlist
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, &[]),
+            query_network("169.254.169.254", 80, &caps, &[], &[]),
             QueryResult::Denied { .. }
         ));
         // Also denied even if explicitly in the allowlist
         let allowed = vec!["169.254.169.254".to_string()];
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, &allowed),
+            query_network("169.254.169.254", 80, &caps, &allowed, &[]),
             QueryResult::Denied { .. }
         ));
     }

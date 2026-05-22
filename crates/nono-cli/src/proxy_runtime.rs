@@ -16,7 +16,7 @@ pub(crate) struct ActiveProxyRuntime {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveProxySettings {
     pub(crate) network_profile: Option<String>,
-    pub(crate) allow_domain: Vec<String>,
+    pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
     pub(crate) credentials: Vec<String>,
 }
 
@@ -112,7 +112,11 @@ pub(crate) fn resolve_effective_proxy_settings(
         .clone()
         .or_else(|| prepared.network_profile.clone());
     let mut allow_domain = prepared.allow_domain.clone();
-    allow_domain.extend(args.allow_proxy.clone());
+    allow_domain.extend(
+        args.allow_proxy
+            .iter()
+            .map(|s| crate::profile::AllowDomainEntry::Plain(s.clone())),
+    );
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
 
@@ -155,16 +159,18 @@ pub(crate) fn build_proxy_config_from_flags(
         }
     }
 
-    let routes = network_policy::resolve_credentials(
+    let mut routes = network_policy::resolve_credentials(
         &net_policy,
         &all_credentials,
         &proxy.custom_credentials,
     )?;
+
+    let (plain_hosts, endpoint_routes) =
+        network_policy::partition_allow_domain(&net_policy, &proxy.allow_domain)?;
+    routes.extend(endpoint_routes);
     resolved.routes = routes;
 
-    let expanded_allow_domain =
-        network_policy::expand_proxy_allow(&net_policy, &proxy.allow_domain);
-    let mut proxy_config = network_policy::build_proxy_config(&resolved, &expanded_allow_domain);
+    let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
 
     if let Some(ref addr) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
