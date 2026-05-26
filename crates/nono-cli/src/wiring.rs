@@ -791,12 +791,7 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
 
 fn read_json(path: &Path) -> Result<Value> {
     let content = fs::read_to_string(path).map_err(NonoError::Io)?;
-    let parse_options = jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        ..Default::default()
-    };
-    jsonc_parser::parse_to_serde_value(&content, &parse_options)
+    crate::jsonc::parse(&content)
         .map_err(|e| NonoError::PackageInstall(format!("invalid JSON in {}: {e}", path.display())))
 }
 
