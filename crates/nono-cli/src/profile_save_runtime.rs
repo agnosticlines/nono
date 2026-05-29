@@ -1058,10 +1058,37 @@ fn render_denial_selector(
         }};
     }
 
-    tty_ln!(
-        "{}",
-        theme::fg(" [nono] Review denied paths", t.brand).bold()
-    );
+    // Limit visible rows to prevent the list from exceeding the terminal
+    // height. When the list is taller than the viewport the cursor-up escape
+    // sequence is capped at the top of the screen, which corrupts the UI and
+    // erases prior terminal history on subsequent redraws.
+    const MAX_VISIBLE: usize = 15;
+    let start = if items.len() <= MAX_VISIBLE {
+        0
+    } else if cursor < MAX_VISIBLE / 2 {
+        0
+    } else if cursor + MAX_VISIBLE / 2 >= items.len() {
+        items.len() - MAX_VISIBLE
+    } else {
+        cursor - MAX_VISIBLE / 2
+    };
+    let end = (start + MAX_VISIBLE).min(items.len());
+
+    if items.len() > MAX_VISIBLE {
+        tty_ln!(
+            "{}  {}",
+            theme::fg(" [nono] Review denied paths", t.brand).bold(),
+            theme::fg(
+                &format!("({}-{} of {})", start + 1, end, items.len()),
+                t.subtext
+            )
+        );
+    } else {
+        tty_ln!(
+            "{}",
+            theme::fg(" [nono] Review denied paths", t.brand).bold()
+        );
+    }
     tty_ln!(
         "  {}",
         "↑/↓ move  ·  Space cycle  ·  a grant-all  ·  d deny-all  ·  Enter confirm  ·  Esc cancel"
@@ -1069,7 +1096,8 @@ fn render_denial_selector(
     );
     tty_ln!("");
 
-    for (i, item) in items.iter().enumerate() {
+    for i in start..end {
+        let item = &items[i];
         let selected = i == cursor;
 
         let cursor_glyph = if selected {
